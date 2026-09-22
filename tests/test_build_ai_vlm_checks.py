@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from functools import partial
@@ -876,14 +877,45 @@ def _evaluate_hosted_hand_count(
     )
 
 
+def test_hosted_first_attempt_success_emits_no_retry_record(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def respond(
+        *_arguments: object, **_keyword_arguments: object
+    ) -> AsyncIterator[httpx2.Response]:
+        response = _hosted_success_response()
+        try:
+            yield response
+        finally:
+            await response.aclose()
+
+    monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(respond))
+    with caplog.at_level(logging.INFO, logger="hflow.build_ai_vlm_checks"):
+        outcome = _evaluate_hosted_hand_count()
+    assert isinstance(outcome, hflow.build_ai_vlm_checks.ParsedVisionModelOutcome)
+    retry_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "hflow.build_ai_vlm_checks"
+        and record.getMessage().startswith("HFlow hosted check retry scheduled:")
+    ]
+    assert retry_messages == []
+
+
 @pytest.mark.parametrize("status_code", [429, 502, 503, 504, None])
 def test_hosted_retry_recovers_transient_failures(
     monkeypatch: pytest.MonkeyPatch,
     hosted_clock: list[float],
+    caplog: pytest.LogCaptureFixture,
     status_code: int | None,
 ) -> None:
     from contextlib import asynccontextmanager
 
+    secret_sentinel = "hosted-retry-secret-sentinel"
     responses = iter((status_code, 200))
 
     @asynccontextmanager
@@ -892,14 +924,16 @@ def test_hosted_retry_recovers_transient_failures(
     ) -> AsyncIterator[httpx2.Response]:
         next_status = next(responses)
         if next_status is None:
-            raise httpx2.ConnectError("connection interrupted")
+            raise httpx2.ConnectError(f"connection interrupted {secret_sentinel}")
         response = (
             _hosted_success_response()
             if next_status == 200
             else httpx2.Response(
                 next_status,
                 headers={"Retry-After": "2"},
-                request=httpx2.Request("POST", "https://checks.example/evaluate"),
+                request=httpx2.Request(
+                    "POST", f"https://checks.example/evaluate?secret={secret_sentinel}"
+                ),
             )
         )
         try:
@@ -908,19 +942,38 @@ def test_hosted_retry_recovers_transient_failures(
             await response.aclose()
 
     monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(respond))
-    outcome = _evaluate_hosted_hand_count()
+    with caplog.at_level(logging.INFO, logger="hflow.build_ai_vlm_checks"):
+        outcome = _evaluate_hosted_hand_count()
     assert isinstance(outcome, hflow.build_ai_vlm_checks.ParsedVisionModelOutcome)
     assert outcome.predicted_value == 2
     assert hosted_clock[0] == (1 if status_code is None else 2)
+
+    retry_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "hflow.build_ai_vlm_checks"
+        and record.getMessage().startswith("HFlow hosted check retry scheduled:")
+    ]
+    assert len(retry_messages) == 1
+    expected_category = f"HTTP {status_code}" if status_code is not None else "ConnectError"
+    expected_delay = 1.0 if status_code is None else 2.0
+    assert (
+        f"next attempt 2 in {expected_delay:.1f} seconds after {expected_category}"
+        in retry_messages[0]
+    )
+    assert secret_sentinel not in retry_messages[0]
 
 
 @pytest.mark.parametrize("failure", ["authorization", "malformed", "exhausted", "retry-budget"])
 def test_hosted_request_does_not_turn_terminal_failures_into_success(
     monkeypatch: pytest.MonkeyPatch,
     hosted_clock: list[float],
+    caplog: pytest.LogCaptureFixture,
     failure: str,
 ) -> None:
     from contextlib import asynccontextmanager
+
+    secret_sentinel = "hosted-terminal-secret-sentinel"
 
     failure_responses = {
         "authorization": [httpx2.Response(401)],
@@ -940,18 +993,32 @@ def test_hosted_request_does_not_turn_terminal_failures_into_success(
         *_arguments: object, **_keyword_arguments: object
     ) -> AsyncIterator[httpx2.Response]:
         response = next(responses)
-        response.request = httpx2.Request("POST", "https://checks.example/private-input")
+        response.request = httpx2.Request(
+            "POST", f"https://checks.example/private-input?secret={secret_sentinel}"
+        )
         try:
             yield response
         finally:
             await response.aclose()
 
     monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(respond))
-    with pytest.raises(RuntimeError) as captured_error:
-        _evaluate_hosted_hand_count(max_retries=1, total_timeout_seconds=5)
+    with caplog.at_level(logging.INFO, logger="hflow.build_ai_vlm_checks"):
+        with pytest.raises(RuntimeError) as captured_error:
+            _evaluate_hosted_hand_count(max_retries=1, total_timeout_seconds=5)
     assert "private-input" not in str(captured_error.value)
     assert captured_error.value.__cause__ is None
     assert hosted_clock[0] == (1 if failure == "exhausted" else 0)
+    if failure == "exhausted":
+        assert str(captured_error.value) == "HFlow hosted check request failed with HTTP 503"
+
+    retry_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "hflow.build_ai_vlm_checks"
+        and record.getMessage().startswith("HFlow hosted check retry scheduled:")
+    ]
+    assert len(retry_messages) == (1 if failure == "exhausted" else 0)
+    assert all(secret_sentinel not in message for message in retry_messages)
 
 
 def test_hosted_response_that_crosses_the_total_budget_is_not_accepted(
